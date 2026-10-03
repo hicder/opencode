@@ -9,7 +9,7 @@ import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import type { MainApp, MainStorage, Surfaces, Windows } from "../sdk/main"
 import { createBrowserPage, type BrowserPage, type Shared } from "./chromium"
 import { browserFailure } from "./errors"
-import { createBrowserNetwork, type BrowserNetwork } from "./network"
+import { createBrowserNetworks, type BrowserNetwork } from "./network"
 import { destinationOrigin, fileURLWithin } from "./policy"
 import { createRefs } from "./refs"
 import type { PaneEvent } from "./remote"
@@ -57,6 +57,7 @@ export function createBrowserPane(input: {
   const releasing = new Set<Promise<void>>()
   // Keep long-lived RPC requests off Chromium's shared HTTP connection pool.
   const runtime = ManagedRuntime.make(NodeHttpClient.layerNodeHttp)
+  const networks = createBrowserNetworks()
   let disposed = false
   return {
     async register(window: number, binding: string, target: Target) {
@@ -98,19 +99,25 @@ export function createBrowserPane(input: {
           ]),
         ),
         focusedTabID: previous.focusedTabID,
-        // `persist:` keeps cookies and storage on disk, and the hash keeps the partition stable across
-        // reattachments and restarts, so the same session stays logged in.
-        partition: `persist:opencode-browser-${createHash("sha256").update(storageKey).digest("hex").slice(0, 32)}`,
+        // `persist:` keeps cookies and storage on disk, and a name that depends only on the server keeps
+        // them across sessions, reattachments, and restarts. Every session on a server shares one partition.
+        partition: `persist:opencode-browser-${createHash("sha256").update(target.server).digest("hex").slice(0, 32)}`,
         storageKey,
         fileRoots: [],
       }
       // Navigation guards cover documents; subresources (img, script, fetch) also must not read
-      // file: URLs outside the roots. One listener per partition covers every page in this attachment.
+      // file: URLs outside the roots. A partition has one listener and is shared by every session on the
+      // server, so the requesting page decides whose roots apply. Requests from unknown pages are blocked.
       electron.session
         .fromPartition(entry.partition)
-        .webRequest.onBeforeRequest({ urls: ["file://*/*"] }, (details, callback) =>
-          callback({ cancel: !fileURLWithin(details.url, entry.fileRoots) }),
-        )
+        .webRequest.onBeforeRequest({ urls: ["file://*/*"] }, (details, callback) => {
+          const owner = Array.from(entries.values()).find(
+            (item) =>
+              item.partition === entry.partition &&
+              Array.from(item.pages.values()).some((page) => page.contents === details.webContents),
+          )
+          callback({ cancel: !owner || !fileURLWithin(details.url, owner.fileRoots) })
+        })
       // "unsupported" means the server has no browser plugin; the renderer stops retrying.
       let reason: "browser.pane.unsupported" | "browser.pane.replaced" | "browser.pane.suspended" | undefined
       let attached = false
@@ -148,7 +155,7 @@ export function createBrowserPane(input: {
             }
             const attachment = { sessionID, connectionID: crypto.randomUUID() }
             const rpc = client.rpc(Browser.Definition)
-            entry.network = yield* createBrowserNetwork({
+            entry.network = yield* networks.join({
               rpc,
               attachment,
               location: options.location,
@@ -312,6 +319,7 @@ export function createBrowserPane(input: {
       entries.forEach((entry) => close(entry, "browser.pane.suspended"))
       await Promise.all(releasing)
       await runtime.dispose()
+      await networks.dispose()
     },
   }
 
