@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { NodeHttpClient } from "@effect/platform-node"
 import { Browser } from "@opencode/plugin-browser/rpc"
 import { OpenCode } from "@opencode/client/effect"
@@ -97,7 +98,9 @@ export function createBrowserPane(input: {
           ]),
         ),
         focusedTabID: previous.focusedTabID,
-        partition: `opencode-browser-${crypto.randomUUID()}`,
+        // `persist:` keeps cookies and storage on disk, and the hash keeps the partition stable across
+        // reattachments and restarts, so the same session stays logged in.
+        partition: `persist:opencode-browser-${createHash("sha256").update(storageKey).digest("hex").slice(0, 32)}`,
         storageKey,
         fileRoots: [],
       }
